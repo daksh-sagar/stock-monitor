@@ -1,0 +1,50 @@
+name: Scentoria stock monitor
+
+on:
+  schedule:
+    # Every 5 minutes (GitHub's minimum). Note: scheduled runs can be delayed
+    # by several minutes when GitHub is under load — this is normal.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+# Allow the job to commit the updated state file back to the repo.
+permissions:
+  contents: write
+
+# Never run two checks at once (avoids state-commit races).
+concurrency:
+  group: scentoria-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check collections and notify
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}   # optional override
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}     # optional, for reserved topics
+        run: python monitor.py
+
+      - name: Commit updated state
+        if: always()   # still save state even if a notification call failed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -z "$(git status --porcelain state)" ]; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git add state
+          git commit -m "Update seen products [skip ci]"
+          # Retry once against any concurrent change to the remote.
+          git push || (git pull --rebase --autostash && git push)
