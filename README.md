@@ -95,6 +95,10 @@ Optional secrets:
   ```
 - **Reset / re-seed:** delete the relevant `state/*.json` and the next run
   re-seeds that collection silently.
+- **If the state commit step fails** (`403`/permission denied on push): go to
+  **Settings → Actions → General → Workflow permissions** and select
+  *"Read and write permissions"*. (The workflow also declares this itself, which
+  is usually enough.)
 - **If the cron stops after ~60 days:** GitHub disables scheduled workflows in
   repos with no recent activity. The state commits usually keep it alive; if not,
   just open the Actions tab and re-enable, or push any commit.
