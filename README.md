@@ -1,131 +1,110 @@
 # Scentoria stock monitor
 
-Watches two Scentoria collections and sends a **free push notification to your
-phone** (via [ntfy](https://ntfy.sh)):
+A **Cloudflare Worker** (cron trigger, every 2 minutes) that sends a **free push
+notification to your phone** (via [ntfy](https://ntfy.sh)) for:
 
-- **new-arrivals** → alerts when a **new product is listed**.
-- **restocked-gems** → alerts when an item is **back in stock** (or a new
-  in-stock item drops).
+- **new-arrivals** → when a **new product is listed**.
+- **restocked-gems** → when a tester / retail / partial / set variant comes
+  **back in stock** (decants, samples, miniatures & roll-ons are ignored).
 
-It runs on a **GitHub Actions** cron (every ~5 minutes). No server, no cost.
+No server to run, no cost. Cloudflare's free tier covers it comfortably.
 
 ## How it works
 
-1. The site is a Shopify store, so each collection exposes a clean JSON feed at
+1. The site is a Shopify store, so each collection has a JSON feed at
    `…/collections/<name>/products.json`. No HTML scraping.
-2. `monitor.py` reads both feeds and compares against the last saved snapshot in
-   `state/`. Each collection uses a different detection mode:
-   - **new-arrivals (`added` mode):** tracks the set of listed product IDs and
-     alerts on a newly-appearing one. It's sorted newest-first and has no
-     sold-out items, so we only read the top few pages (the collection has
-     5000+ items — no need to fetch them all every few minutes).
-   - **restocked-gems (`restocked` mode):** this collection *keeps sold-out
-     items listed* and just flips their stock flag, so a restock is **not** a new
-     product ID — it's a variant becoming available. So we track availability at
-     the **variant (SKU) level** and alert when a variant flips to in-stock.
-     - **Decants, samples, miniatures and roll-ons are ignored** (see
-       `EXCLUDE_VARIANT_TYPES` in `monitor.py`). Only testers, retail bottles,
-       partials and full-size/sets trigger alerts.
-     - We read the whole collection (~1.2k items) since it isn't date-sorted.
+2. On each run the Worker reads both feeds and compares to the last snapshot
+   stored in **Workers KV**:
+   - **new-arrivals (`added`):** tracks listed product IDs; alerts on a new one.
+     Sorted newest-first, so we only read the top 3 pages (it has 5000+ items).
+   - **restocked-gems (`restocked`):** this collection *keeps sold-out items
+     listed* and flips their stock flag, so a restock is a **variant** becoming
+     available, not a new product. We track availability at the **SKU/variant**
+     level and ignore small formats (`EXCLUDE_VARIANT_TYPES` in
+     `src/worker.js`). We read the whole collection (~1.2k items).
 3. **Availability is double-checked.** The collection feed's `available` flag is
    accurate but CDN-cached, and Shopify's per-product `.json` endpoint omits
-   availability entirely. So before sending a restock alert we re-confirm that
-   exact variant in real time via the storefront `…/products/<handle>.js`
-   endpoint (the same data the live page uses). Unconfirmed candidates aren't
-   alerted and are re-checked next run.
-4. What does **not** alert: a decant restocking, a product selling out, or a
-   product being removed from a collection.
-5. The Action commits the updated `state/*.json` back to the repo so the next
-   run remembers what it has already seen.
-6. **First run seeds silently** — it records the current state and sends one
-   "monitoring started" message instead of flooding you with everything.
-
-To change which SKU types notify you, edit `EXCLUDE_VARIANT_TYPES` in
-`monitor.py` (it's a list of substrings matched case-insensitively against each
-variant's name, e.g. `"DECANT"`, `"SAMPLE"`).
+   availability. So before alerting a restock we re-confirm that exact variant
+   in real time via `…/products/<handle>.js`. Unconfirmed candidates aren't
+   alerted and get re-checked next run.
+4. **KV writes only on change.** We read every run but only write when the
+   tracked set actually changes — staying well under the free tier's 1,000
+   writes/day.
+5. What does **not** alert: a decant restocking, an item selling out, or a
+   product being removed.
+6. **First run seeds silently** — records current state and sends one
+   "monitoring started" message instead of flooding you.
 
 ## One-time setup
 
-### 1. Install the ntfy app and subscribe to your topic
+### 1. Install ntfy and subscribe to your topic
 
-- Install **ntfy** on your phone: [iOS](https://apps.apple.com/app/ntfy/id1625396347)
-  / [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy)
-  (or F-Droid). No account needed.
-- In the app: **+ → Subscribe to topic** and enter your secret topic name.
-  A pre-generated random one for you:
+- Install **ntfy**: [iOS](https://apps.apple.com/app/ntfy/id1625396347) /
+  [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy). No
+  account needed.
+- **+ → Subscribe to topic**, enter a long random topic name (this is your only
+  "password" on the free tier, so keep it unguessable):
 
   ```
   scentoria-kmiw08euftlucpwx
   ```
+- Test it: `curl -d "It works!" ntfy.sh/scentoria-kmiw08euftlucpwx`
 
-  > The topic name is your only "password". On ntfy's free tier topics aren't
-  > reserved, so anyone who knows the name could read/spam it — that's why we use
-  > a long random one. You can pick your own; just keep it unguessable.
-- Test it from any terminal — you should get a push instantly:
-
-  ```bash
-  curl -d "It works!" ntfy.sh/scentoria-kmiw08euftlucpwx
-  ```
-
-### 2. Create the GitHub repo
-
-`gh` isn't installed here, so create it on github.com (or install `gh`):
+### 2. Authenticate Cloudflare
 
 ```bash
 cd /Users/daksh/Documents/scentoria-monitor
-git init
-git add .
-git commit -m "Initial commit: Scentoria stock monitor"
-git branch -M main
-# Create an EMPTY repo named scentoria-monitor on github.com, then:
-git remote add origin https://github.com/<your-username>/scentoria-monitor.git
-git push -u origin main
+npx wrangler login        # opens a browser; pick your Cloudflare account
 ```
 
-> **Make the repo public.** GitHub Actions minutes are *unlimited and free for
-> public repos*. On a private repo the free tier is 2,000 min/month, which a
-> 5-minute cron would blow past. Your code and the saved product IDs are
-> harmless to expose; the topic name stays hidden in Secrets (next step).
+(Free Cloudflare account is fine. If you don't have one, sign up at
+dash.cloudflare.com first.)
 
-### 3. Add your topic as a repository secret
+### 3. Create the KV namespace and add its id
 
-In the repo: **Settings → Secrets and variables → Actions → New repository
-secret**
+```bash
+npx wrangler kv namespace create STATE
+```
 
-| Name | Value |
-| --- | --- |
-| `NTFY_TOPIC` | `scentoria-kmiw08euftlucpwx` (or your chosen topic) |
+Copy the printed `id` into `wrangler.toml`, replacing `REPLACE_WITH_KV_NAMESPACE_ID`.
 
-Optional secrets:
-- `NTFY_SERVER` — only if you self-host ntfy (default `https://ntfy.sh`).
-- `NTFY_TOKEN` — only if you later reserve the topic and protect it with auth.
+### 4. Set your ntfy topic as a secret
 
-### 4. Turn it on and test
+```bash
+echo "scentoria-kmiw08euftlucpwx" | npx wrangler secret put NTFY_TOPIC
+```
 
-- **Settings → Actions → General**: ensure Actions are enabled. (If GitHub
-  prompts to enable scheduled workflows, confirm.)
-- **Actions tab → "Scentoria stock monitor" → Run workflow** to trigger it
-  manually. The first run seeds state and sends the "monitoring started" push.
-- After that, the cron takes over automatically.
+Optional secrets: `NTFY_TOKEN` (only for an auth-protected/reserved topic).
+`NTFY_SERVER` defaults to `https://ntfy.sh` (see `[vars]` in `wrangler.toml`).
 
-## Notes & tuning
+### 5. Deploy
 
-- **Frequency:** change the `cron:` line in
-  `.github/workflows/monitor.yml`. `*/5 * * * *` is every 5 min (GitHub's
-  minimum). Scheduled runs can be delayed several minutes under GitHub load —
-  normal and unavoidable on the free tier.
-- **Local test run** (sends real notifications):
-  ```bash
-  NTFY_TOPIC=scentoria-kmiw08euftlucpwx python3 monitor.py
-  ```
-- **Reset / re-seed:** delete the relevant `state/*.json` and the next run
-  re-seeds that collection silently.
-- **If the state commit step fails** (`403`/permission denied on push): go to
-  **Settings → Actions → General → Workflow permissions** and select
-  *"Read and write permissions"*. (The workflow also declares this itself, which
-  is usually enough.)
-- **If the cron stops after ~60 days:** GitHub disables scheduled workflows in
-  repos with no recent activity. The state commits usually keep it alive; if not,
-  just open the Actions tab and re-enable, or push any commit.
-- **Add more collections:** add entries to the `COLLECTIONS` dict in
-  `monitor.py`.
+```bash
+npx wrangler deploy
+```
+
+The cron starts immediately. The first run seeds state silently and sends the
+"monitoring started" pushes.
+
+## Testing & operating it
+
+- **Logic tests** (offline, no Cloudflare needed): `npm test`
+- **Trigger a run manually** (also a health check) — open in a browser:
+  `https://scentoria-monitor.<your-subdomain>.workers.dev/?key=scentoria-kmiw08euftlucpwx`
+  (the `key` must equal your `NTFY_TOPIC`). It returns a one-line status per
+  collection.
+- **Live logs:** `npx wrangler tail`
+- **Change frequency:** edit `crons` in `wrangler.toml` (e.g. `"*/1 * * * *"`
+  for every minute) and redeploy.
+- **Change which SKU types alert:** edit `EXCLUDE_VARIANT_TYPES` in
+  `src/worker.js` and redeploy.
+- **Reset a collection:** `npx wrangler kv key delete --binding=STATE <name>`
+  (`new-arrivals` or `restocked-gems`); next run re-seeds it silently.
+
+## Notes
+
+- **Politeness/limits:** the restocked feed is ~3.5 MB. Every 2 minutes is a
+  deliberate balance — feel free to loosen it. Cloudflare free tier allows down
+  to 1-minute cron.
+- The notification target lives in a Worker **secret**, so this repo is safe to
+  keep public.

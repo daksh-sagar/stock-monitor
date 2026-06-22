@@ -1,0 +1,21 @@
+name = "scentoria-monitor"
+main = "src/worker.js"
+compatibility_date = "2026-06-01"
+
+# Cron Trigger: every 2 minutes (Cloudflare allows down to every 1 minute).
+# Change this to "*/1 * * * *" for 1-min, or "*/5 * * * *" to match the old setup.
+[triggers]
+crons = ["*/2 * * * *"]
+
+# State storage. The `id` is filled in by `wrangler kv namespace create STATE`
+# (see README). The binding name `STATE` must match env.STATE in src/worker.js.
+[[kv_namespaces]]
+binding = "STATE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Default ntfy server; override per-deploy with a secret if you self-host.
+[vars]
+NTFY_SERVER = "https://ntfy.sh"
+
+[observability]
+enabled = true
