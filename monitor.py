@@ -48,7 +48,8 @@ PRODUCT_URL = "https://scentoria.co.in/products/{handle}"
 COLLECTION_URL = "https://scentoria.co.in/collections/{collection}"
 
 STATE_DIR = Path("state")
-USER_AGENT = "scentoria-monitor/1.0 (+https://github.com/)"
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 PAGE_SIZE = 250          # Shopify max per page
 HARD_PAGE_CAP = 25       # safety stop for full fetches (= up to 6250 products)
 # If more than this many new products appear at once, send one summary instead
@@ -112,21 +113,44 @@ def product_image(p):
     return None
 
 
-def is_available(p):
-    """True if any variant of the product is in stock."""
-    return any(v.get("available") for v in (p.get("variants") or []))
+# Variant types we IGNORE for restock alerts (small try-size formats). Matched
+# case-insensitively as a substring of the variant's option/title. "DECAANT"
+# covers a real typo present in the store's data.
+EXCLUDE_VARIANT_TYPES = (
+    "DECANT", "DECAANT", "SAMPLE", "MINIATURE", "ROLL ON", "ROLL-ON", "ROLLON",
+)
 
 
-def tracked_products(products, mode):
-    """Map of product-id -> product for the items this collection alerts on.
+def variant_name(v):
+    return v.get("option1") or v.get("title") or "?"
 
-    "restocked" mode tracks only in-stock products, so a sold-out item coming
-    back (or a new in-stock item) shows up as a newly-tracked id. "added" mode
-    tracks every listed product, so a new listing shows up as a new id.
+
+def is_notifiable_variant(v):
+    """False for the small try-size formats we ignore (decant, sample,
+    miniature, roll-on); True for testers, retail, partials, sets, etc."""
+    name = variant_name(v).upper()
+    return not any(t in name for t in EXCLUDE_VARIANT_TYPES)
+
+
+def live_available_variants(handle):
+    """Real-time set of in-stock variant-id strings for a product, read from the
+    storefront `.js` endpoint — the same data the live product page uses.
+
+    The collection products.json feed carries an `available` flag that matches
+    the live page, but it's CDN-cached, and Shopify's per-product `.json`
+    endpoint omits availability entirely. So we use this to *confirm* a candidate
+    restock in real time before notifying. Returns None if the check itself
+    failed (network/parse), so the caller can retry next run instead of acting.
     """
-    if mode == "restocked":
-        return {str(p["id"]): p for p in products if is_available(p)}
-    return {str(p["id"]): p for p in products}
+    url = f"https://scentoria.co.in/products/{handle}.js"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"   live-check failed for {handle}: {e}", file=sys.stderr)
+        return None
+    return {str(v.get("id")) for v in data.get("variants", []) if v.get("available")}
 
 
 def send_ntfy(title, message, click=None, tags=None, priority=None, icon=None):
@@ -161,46 +185,157 @@ def send_ntfy(title, message, click=None, tags=None, priority=None, icon=None):
     return False
 
 
-def notify(collection, mode, products):
-    label = collection.replace("-", " ").title()
-    tag = "fire" if mode == "restocked" else "shopping_bags"
-
+def notify_added(collection, label, products):
+    """Notify about newly-listed products (new-arrivals)."""
     if len(products) > MAX_INDIVIDUAL:
         preview = ", ".join(p.get("title", "?") for p in products[:5])
-        headline = (f"{len(products)} back in stock in {label}"
-                    if mode == "restocked"
-                    else f"{len(products)} new in {label}")
         send_ntfy(
-            title=headline,
+            title=f"{len(products)} new in {label}",
             message=f"{preview} … and {len(products) - 5} more.",
             click=COLLECTION_URL.format(collection=collection),
-            tags=[tag],
-            priority=4,
+            tags=["shopping_bags"], priority=4,
         )
         return
-
     for p in products:
         price = product_price(p)
-        price_str = f"₹{price}" if price else None
-        if mode == "restocked":
-            head = "In stock now" + (f" · {price_str}" if price_str else "")
-        else:
-            head = price_str or "New product"
+        head = f"₹{price}" if price else "New product"
         send_ntfy(
             title=p.get("title", "Product"),
             message=f"{head}\nin {label}",
             click=PRODUCT_URL.format(handle=p.get("handle", "")),
-            tags=[tag],
-            priority=4,
-            icon=product_image(p),
+            tags=["shopping_bags"], priority=4, icon=product_image(p),
         )
+
+
+def notify_restocked(collection, label, items):
+    """Notify about variants back in stock. `items` is a list of
+    (product, variant); we group by product so a product restocking several
+    variants is one notification that names the variants."""
+    by_product = {}
+    for p, v in items:
+        by_product.setdefault(str(p["id"]), (p, []))[1].append(v)
+    groups = list(by_product.values())
+
+    if len(groups) > MAX_INDIVIDUAL:
+        preview = ", ".join(p.get("title", "?") for p, _ in groups[:5])
+        send_ntfy(
+            title=f"{len(groups)} back in stock in {label}",
+            message=f"{preview} … and {len(groups) - 5} more.",
+            click=COLLECTION_URL.format(collection=collection),
+            tags=["fire"], priority=4,
+        )
+        return
+
+    for p, vs in groups:
+        names = ", ".join(variant_name(v) for v in vs)
+        prices = [v.get("price") for v in vs if v.get("price")]
+        if prices:
+            cheapest = min(prices, key=float)
+            price_line = f" · ₹{cheapest}" if len(prices) == 1 else f" · from ₹{cheapest}"
+        else:
+            price_line = ""
+        send_ntfy(
+            title=p.get("title", "Product"),
+            message=f"Back in stock: {names}{price_line}\nin {label}",
+            click=PRODUCT_URL.format(handle=p.get("handle", "")),
+            tags=["fire"], priority=4, icon=product_image(p),
+        )
+
+
+def process_added(name, label, products):
+    """new-arrivals: alert when a new product id appears in the feed."""
+    current = {str(p["id"]): p for p in products}
+    seen = load_seen(name)
+    if seen is None:
+        save_seen(name, current.keys())
+        print(f"[{name}] first run — seeded {len(current)} products (no alerts).")
+        send_ntfy(
+            title=f"Monitoring started: {label}",
+            message=(f"Now tracking {len(current)} products in {label}. "
+                     f"You'll be alerted on new additions."),
+            tags=["eyes"],
+        )
+        return
+    fresh = [current[k] for k in current if k not in seen]
+    if fresh:
+        print(f"[{name}] {len(fresh)} new listing(s):")
+        for p in fresh:
+            print(f"    + {p.get('title')} ({p.get('handle')})")
+        notify_added(name, label, fresh)
+    else:
+        print(f"[{name}] no new products ({len(current)} tracked).")
+    save_seen(name, current.keys())
+
+
+def process_restocked(name, label, products):
+    """restocked-gems: track in-stock, notifiable variants and alert when one
+    becomes available — confirmed in real time before notifying."""
+    # Candidate in-stock notifiable variants from the (cached) collection feed.
+    candidates = {}  # variant-id -> (product, variant)
+    for p in products:
+        for v in (p.get("variants") or []):
+            if v.get("available") and is_notifiable_variant(v):
+                candidates[str(v["id"])] = (p, v)
+
+    # Health guard: this collection always has plenty in stock. If the feed
+    # suddenly reports none (e.g. the `available` field vanished), don't wipe
+    # state or alert — just skip and let it recover.
+    if not candidates:
+        print(f"[{name}] 0 in-stock notifiable variants — suspicious, skipping.",
+              file=sys.stderr)
+        return
+
+    seen = load_seen(name)
+    if seen is None:
+        save_seen(name, candidates.keys())
+        print(f"[{name}] first run — seeded {len(candidates)} in-stock variants (no alerts).")
+        send_ntfy(
+            title=f"Monitoring started: {label}",
+            message=(f"Watching {label} for restocks of testers, retail, partials "
+                     f"& sets (decants, samples & miniatures ignored). Tracking "
+                     f"{len(candidates)} in-stock variants — you'll be alerted when "
+                     f"more come back."),
+            tags=["eyes"],
+        )
+        return
+
+    fresh_ids = [vid for vid in candidates if vid not in seen]
+
+    # Confirm each candidate restock in real time via the .js endpoint before
+    # notifying (one fetch per product). Guards against a stale cached flag.
+    confirmed, confirmed_ids = [], set()
+    by_handle = {}
+    for vid in fresh_ids:
+        p, _ = candidates[vid]
+        by_handle.setdefault(p.get("handle"), []).append(vid)
+    for handle, vids in by_handle.items():
+        live = live_available_variants(handle)
+        if live is None:
+            continue  # couldn't confirm — leave unseen so we retry next run
+        for vid in vids:
+            if vid in live:
+                confirmed_ids.add(vid)
+                confirmed.append(candidates[vid])
+
+    if confirmed:
+        print(f"[{name}] {len(confirmed)} confirmed restock(s):")
+        for p, v in confirmed:
+            print(f"    + {p.get('title')} — {variant_name(v)}")
+        notify_restocked(name, label, confirmed)
+    else:
+        unconfirmed = len(fresh_ids) - len(confirmed_ids)
+        extra = f" ({unconfirmed} candidate(s) not confirmed)" if unconfirmed else ""
+        print(f"[{name}] no confirmed restocks ({len(candidates)} in stock){extra}.")
+
+    # Keep previously-seen variants that are still in stock, plus the newly
+    # confirmed ones. Unconfirmed candidates stay out so they're re-checked.
+    save_seen(name, (seen & set(candidates)) | confirmed_ids)
 
 
 def main():
     if not NTFY_TOPIC:
         sys.exit("NTFY_TOPIC env var is required.")
 
-    exit_code = 0
     for name, cfg in COLLECTIONS.items():
         mode = cfg.get("mode", "added")
         label = name.replace("-", " ").title()
@@ -208,49 +343,20 @@ def main():
             products = fetch_products(cfg["url"], cfg.get("max_pages"))
         except Exception as e:  # network / parse errors: skip without touching state
             print(f"[{name}] fetch failed: {e}", file=sys.stderr)
-            exit_code = 1
             continue
 
         if not products:
             # Empty response is almost certainly a transient glitch, not a real
             # "collection is now empty". Skip so we never wipe state or misfire.
             print(f"[{name}] returned 0 products — skipping this run.", file=sys.stderr)
-            exit_code = 1
             continue
 
-        tracked = tracked_products(products, mode)
-        seen = load_seen(name)
-
-        if seen is None:
-            save_seen(name, tracked.keys())
-            print(f"[{name}] first run — seeded {len(tracked)} (mode={mode}, no alerts).")
-            if mode == "restocked":
-                msg = (f"Watching {label} for restocks. {len(tracked)} items "
-                       f"currently in stock — you'll be alerted when sold-out "
-                       f"items come back or new in-stock ones drop.")
-            else:
-                msg = (f"Now tracking {len(tracked)} products in {label}. "
-                       f"You'll be alerted on new additions.")
-            send_ntfy(title=f"Monitoring started: {label}", message=msg, tags=["eyes"])
-            continue
-
-        # A "fresh" item is one tracked now but not in the previous snapshot:
-        #   added mode     -> a newly-listed product.
-        #   restocked mode -> in stock now but wasn't before (back in stock, or a
-        #                     brand-new in-stock item). Sold-outs/removals just
-        #                     drop out of the set and never alert.
-        fresh = [tracked[pid] for pid in tracked if pid not in seen]
-        if fresh:
-            print(f"[{name}] {len(fresh)} alert(s) (mode={mode}):")
-            for p in fresh:
-                print(f"    + {p.get('title')} ({p.get('handle')})")
-            notify(name, mode, fresh)
+        if mode == "restocked":
+            process_restocked(name, label, products)
         else:
-            print(f"[{name}] nothing new ({len(tracked)} tracked, mode={mode}).")
+            process_added(name, label, products)
 
-        save_seen(name, tracked.keys())
-
-    return exit_code
+    return 0
 
 
 if __name__ == "__main__":
