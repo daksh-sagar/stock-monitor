@@ -2,6 +2,12 @@ name = "scentoria-monitor"
 main = "src/worker.js"
 compatibility_date = "2026-06-01"
 
+# Enables the workers.dev URL (the `fetch` handler in src/worker.js, used as a
+# manual trigger / health check). The first `wrangler deploy` will prompt you to
+# register a workers.dev subdomain — that one-time step also enables cron
+# triggers on the account. Set this false later if you want cron-only.
+workers_dev = true
+
 # Cron Trigger: every 2 minutes (Cloudflare allows down to every 1 minute).
 # Change this to "*/1 * * * *" for 1-min, or "*/5 * * * *" to match the old setup.
 [triggers]
@@ -11,7 +17,7 @@ crons = ["*/2 * * * *"]
 # (see README). The binding name `STATE` must match env.STATE in src/worker.js.
 [[kv_namespaces]]
 binding = "STATE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "c9ac01a075cd42179cddb8ce25ded50f"
 
 # Default ntfy server; override per-deploy with a secret if you self-host.
 [vars]
