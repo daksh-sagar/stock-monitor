@@ -342,6 +342,27 @@ export default {
         status: 403,
       });
     }
+    // ?test=1 -> send a one-off push and return the raw ntfy response (diagnostic).
+    if (url.searchParams.get("test") === "1") {
+      const server = (env.NTFY_SERVER || "https://ntfy.sh").replace(/\/+$/, "");
+      const reqBody = JSON.stringify({
+        topic: env.NTFY_TOPIC,
+        title: "✅ Scentoria monitor test",
+        message: "If you can read this on your phone, notifications work.",
+        tags: ["white_check_mark"],
+        priority: 4,
+      });
+      const headers = { "Content-Type": "application/json" };
+      if (env.NTFY_TOKEN) headers["Authorization"] = `Bearer ${env.NTFY_TOKEN}`;
+      try {
+        const r = await fetch(server, { method: "POST", headers, body: reqBody });
+        const text = await r.text();
+        const auth = env.NTFY_TOKEN ? "authenticated" : "ANONYMOUS";
+        return new Response(`POST ${server} (${auth})\nHTTP ${r.status}\n${text}\n`);
+      } catch (e) {
+        return new Response(`ntfy POST threw: ${e}\n`);
+      }
+    }
     const out = await runChecks(env);
     return new Response(out + "\n", { headers: { "content-type": "text/plain" } });
   },
