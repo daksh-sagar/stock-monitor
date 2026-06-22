@@ -21,16 +21,28 @@ It runs on a **GitHub Actions** cron (every ~5 minutes). No server, no cost.
      5000+ items — no need to fetch them all every few minutes).
    - **restocked-gems (`restocked` mode):** this collection *keeps sold-out
      items listed* and just flips their stock flag, so a restock is **not** a new
-     product ID. Instead we track the set of **in-stock** product IDs and alert
-     when one becomes available — i.e. a sold-out item coming back, or a new
-     in-stock item. We read the whole collection (~1.2k items) since it isn't
-     date-sorted.
-3. What does **not** alert: a product selling out, or a product being removed
-   from a collection. We only notify on new listings / items becoming available.
-4. The Action commits the updated `state/*.json` back to the repo so the next
+     product ID — it's a variant becoming available. So we track availability at
+     the **variant (SKU) level** and alert when a variant flips to in-stock.
+     - **Decants, samples, miniatures and roll-ons are ignored** (see
+       `EXCLUDE_VARIANT_TYPES` in `monitor.py`). Only testers, retail bottles,
+       partials and full-size/sets trigger alerts.
+     - We read the whole collection (~1.2k items) since it isn't date-sorted.
+3. **Availability is double-checked.** The collection feed's `available` flag is
+   accurate but CDN-cached, and Shopify's per-product `.json` endpoint omits
+   availability entirely. So before sending a restock alert we re-confirm that
+   exact variant in real time via the storefront `…/products/<handle>.js`
+   endpoint (the same data the live page uses). Unconfirmed candidates aren't
+   alerted and are re-checked next run.
+4. What does **not** alert: a decant restocking, a product selling out, or a
+   product being removed from a collection.
+5. The Action commits the updated `state/*.json` back to the repo so the next
    run remembers what it has already seen.
-5. **First run seeds silently** — it records the current state and sends one
+6. **First run seeds silently** — it records the current state and sends one
    "monitoring started" message instead of flooding you with everything.
+
+To change which SKU types notify you, edit `EXCLUDE_VARIANT_TYPES` in
+`monitor.py` (it's a list of substrings matched case-insensitively against each
+variant's name, e.g. `"DECANT"`, `"SAMPLE"`).
 
 ## One-time setup
 
