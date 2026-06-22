@@ -83,8 +83,10 @@ Optional secrets: `NTFY_TOKEN` (only for an auth-protected/reserved topic).
 npx wrangler deploy
 ```
 
-The cron starts immediately. The first run seeds state silently and sends the
-"monitoring started" pushes.
+On a new account the first deploy prompts: **"register a workers.dev subdomain
+now?"** — say yes and pick any name (this is a one-time account setup that also
+enables cron triggers). The cron then starts immediately; the first run seeds
+state silently and sends the "monitoring started" pushes.
 
 ## Testing & operating it
 
