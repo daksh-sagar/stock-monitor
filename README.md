@@ -1,10 +1,11 @@
 # Scentoria stock monitor
 
 Watches two Scentoria collections and sends a **free push notification to your
-phone** (via [ntfy](https://ntfy.sh)) whenever a new product is added:
+phone** (via [ntfy](https://ntfy.sh)):
 
-- https://scentoria.co.in/collections/new-arrivals
-- https://scentoria.co.in/collections/restocked-gems
+- **new-arrivals** → alerts when a **new product is listed**.
+- **restocked-gems** → alerts when an item is **back in stock** (or a new
+  in-stock item drops).
 
 It runs on a **GitHub Actions** cron (every ~5 minutes). No server, no cost.
 
@@ -12,12 +13,24 @@ It runs on a **GitHub Actions** cron (every ~5 minutes). No server, no cost.
 
 1. The site is a Shopify store, so each collection exposes a clean JSON feed at
    `…/collections/<name>/products.json`. No HTML scraping.
-2. `monitor.py` fetches both feeds, compares the product IDs against the last
-   saved snapshot in `state/`, and pushes an ntfy notification for anything new.
-3. The Action commits the updated `state/*.json` back to the repo so the next
+2. `monitor.py` reads both feeds and compares against the last saved snapshot in
+   `state/`. Each collection uses a different detection mode:
+   - **new-arrivals (`added` mode):** tracks the set of listed product IDs and
+     alerts on a newly-appearing one. It's sorted newest-first and has no
+     sold-out items, so we only read the top few pages (the collection has
+     5000+ items — no need to fetch them all every few minutes).
+   - **restocked-gems (`restocked` mode):** this collection *keeps sold-out
+     items listed* and just flips their stock flag, so a restock is **not** a new
+     product ID. Instead we track the set of **in-stock** product IDs and alert
+     when one becomes available — i.e. a sold-out item coming back, or a new
+     in-stock item. We read the whole collection (~1.2k items) since it isn't
+     date-sorted.
+3. What does **not** alert: a product selling out, or a product being removed
+   from a collection. We only notify on new listings / items becoming available.
+4. The Action commits the updated `state/*.json` back to the repo so the next
    run remembers what it has already seen.
-4. **First run seeds silently** — it records the current catalog and sends one
-   "monitoring started" message instead of flooding you with the entire list.
+5. **First run seeds silently** — it records the current state and sends one
+   "monitoring started" message instead of flooding you with everything.
 
 ## One-time setup
 

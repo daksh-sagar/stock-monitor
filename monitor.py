@@ -19,21 +19,29 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Per-collection config. `max_pages` controls how much of the feed we read:
-#   - new-arrivals is sorted newest-published-first, so brand-new products always
-#     appear on page 1. We only need a small window from the top (the collection
-#     itself has 5000+ items — fetching it all every few minutes is needless).
-#   - restocked-gems is NOT date-sorted (it's ordered by when items were added to
-#     the collection, which the feed doesn't expose), so we must read the whole
-#     collection and diff the full set of IDs. It's small (~1.2k items / 5 pages).
+# Per-collection config:
+#   max_pages - how much of the feed to read (None = the whole collection).
+#   mode      - what counts as an alert:
+#       "added"     -> a product ID newly appears in the feed (a new listing).
+#       "restocked" -> a product becomes available: sold-out -> in stock, or a
+#                      brand-new in-stock item. Needed because this store keeps
+#                      sold-out items listed and just flips their stock flag, so a
+#                      restock is NOT a new product ID — it's an availability change.
+#
+# new-arrivals is sorted newest-first and has no sold-out items, so we watch a
+#   small window from the top of the feed for newly-listed products.
+# restocked-gems is "Featured"-sorted and keeps ~half its items sold-out-but-listed,
+#   so we read the whole collection and watch for flips to in-stock.
 COLLECTIONS = {
     "new-arrivals": {
         "url": "https://scentoria.co.in/collections/new-arrivals/products.json",
         "max_pages": 3,      # top ~750 newest; far more headroom than needed per 5 min
+        "mode": "added",
     },
     "restocked-gems": {
         "url": "https://scentoria.co.in/collections/restocked-gems/products.json",
         "max_pages": None,   # read the entire collection
+        "mode": "restocked",
     },
 }
 PRODUCT_URL = "https://scentoria.co.in/products/{handle}"
@@ -104,6 +112,23 @@ def product_image(p):
     return None
 
 
+def is_available(p):
+    """True if any variant of the product is in stock."""
+    return any(v.get("available") for v in (p.get("variants") or []))
+
+
+def tracked_products(products, mode):
+    """Map of product-id -> product for the items this collection alerts on.
+
+    "restocked" mode tracks only in-stock products, so a sold-out item coming
+    back (or a new in-stock item) shows up as a newly-tracked id. "added" mode
+    tracks every listed product, so a new listing shows up as a new id.
+    """
+    if mode == "restocked":
+        return {str(p["id"]): p for p in products if is_available(p)}
+    return {str(p["id"]): p for p in products}
+
+
 def send_ntfy(title, message, click=None, tags=None, priority=None, icon=None):
     """Publish a notification using ntfy's JSON format (UTF-8 safe)."""
     if not NTFY_TOPIC:
@@ -136,28 +161,36 @@ def send_ntfy(title, message, click=None, tags=None, priority=None, icon=None):
     return False
 
 
-def notify_new(collection, products):
+def notify(collection, mode, products):
     label = collection.replace("-", " ").title()
+    tag = "fire" if mode == "restocked" else "shopping_bags"
 
     if len(products) > MAX_INDIVIDUAL:
         preview = ", ".join(p.get("title", "?") for p in products[:5])
+        headline = (f"{len(products)} back in stock in {label}"
+                    if mode == "restocked"
+                    else f"{len(products)} new in {label}")
         send_ntfy(
-            title=f"{len(products)} new in {label}",
+            title=headline,
             message=f"{preview} … and {len(products) - 5} more.",
             click=COLLECTION_URL.format(collection=collection),
-            tags=["shopping_bags"],
+            tags=[tag],
             priority=4,
         )
         return
 
     for p in products:
         price = product_price(p)
-        body = f"₹{price}" if price else "New product"
+        price_str = f"₹{price}" if price else None
+        if mode == "restocked":
+            head = "In stock now" + (f" · {price_str}" if price_str else "")
+        else:
+            head = price_str or "New product"
         send_ntfy(
-            title=p.get("title", "New product"),
-            message=f"{body}\nin {label}",
+            title=p.get("title", "Product"),
+            message=f"{head}\nin {label}",
             click=PRODUCT_URL.format(handle=p.get("handle", "")),
-            tags=["shopping_bags"],
+            tags=[tag],
             priority=4,
             icon=product_image(p),
         )
@@ -169,6 +202,8 @@ def main():
 
     exit_code = 0
     for name, cfg in COLLECTIONS.items():
+        mode = cfg.get("mode", "added")
+        label = name.replace("-", " ").title()
         try:
             products = fetch_products(cfg["url"], cfg.get("max_pages"))
         except Exception as e:  # network / parse errors: skip without touching state
@@ -183,34 +218,37 @@ def main():
             exit_code = 1
             continue
 
-        current = {str(p["id"]): p for p in products}
+        tracked = tracked_products(products, mode)
         seen = load_seen(name)
 
         if seen is None:
-            save_seen(name, current.keys())
-            print(f"[{name}] first run — seeded {len(current)} products (no alerts).")
-            send_ntfy(
-                title=f"Monitoring started: {name}",
-                message=(f"Now tracking {len(current)} products in "
-                         f"{name.replace('-', ' ').title()}. "
-                         f"You'll be alerted on new additions."),
-                tags=["eyes"],
-            )
+            save_seen(name, tracked.keys())
+            print(f"[{name}] first run — seeded {len(tracked)} (mode={mode}, no alerts).")
+            if mode == "restocked":
+                msg = (f"Watching {label} for restocks. {len(tracked)} items "
+                       f"currently in stock — you'll be alerted when sold-out "
+                       f"items come back or new in-stock ones drop.")
+            else:
+                msg = (f"Now tracking {len(tracked)} products in {label}. "
+                       f"You'll be alerted on new additions.")
+            send_ntfy(title=f"Monitoring started: {label}", message=msg, tags=["eyes"])
             continue
 
-        new_products = [current[pid] for pid in current if pid not in seen]
-        if new_products:
-            print(f"[{name}] {len(new_products)} new product(s):")
-            for p in new_products:
+        # A "fresh" item is one tracked now but not in the previous snapshot:
+        #   added mode     -> a newly-listed product.
+        #   restocked mode -> in stock now but wasn't before (back in stock, or a
+        #                     brand-new in-stock item). Sold-outs/removals just
+        #                     drop out of the set and never alert.
+        fresh = [tracked[pid] for pid in tracked if pid not in seen]
+        if fresh:
+            print(f"[{name}] {len(fresh)} alert(s) (mode={mode}):")
+            for p in fresh:
                 print(f"    + {p.get('title')} ({p.get('handle')})")
-            notify_new(name, new_products)
+            notify(name, mode, fresh)
         else:
-            print(f"[{name}] no new products ({len(current)} tracked).")
+            print(f"[{name}] nothing new ({len(tracked)} tracked, mode={mode}).")
 
-        # Update state to the current catalog. Comparing against the *previous*
-        # snapshot means an item removed then re-added (a genuine restock) will
-        # alert again — which is exactly what 'restocked-gems' is about.
-        save_seen(name, current.keys())
+        save_seen(name, tracked.keys())
 
     return exit_code
 
