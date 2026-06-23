@@ -1,6 +1,6 @@
-// Scentoria stock monitor — core logic (runs on Node, driven by src/run.mjs
-// from a GitHub Actions cron). Pure and storage-agnostic: callers inject an
-// `env` with { STATE: {get,put}, TG_BOT_TOKEN, TG_CHAT_ID }.
+// Stock monitor — core logic (runs on Node, driven by src/run.mjs from a
+// GitHub Actions cron). Pure and storage-agnostic: callers inject an `env`
+// with { STORE_BASE_URL, STATE: {get,put}, TG_BOT_TOKEN, TG_CHAT_ID }.
 //
 // Watches two Shopify collections and pushes a phone notification via a
 // Telegram bot:
@@ -21,26 +21,18 @@
 // once its notification has actually been delivered — a failed send leaves it
 // unseen so it is retried next run instead of being silently lost.
 //
-// Required: env.TG_BOT_TOKEN, env.TG_CHAT_ID.
+// Required: env.STORE_BASE_URL, env.TG_BOT_TOKEN, env.TG_CHAT_ID.
 //
 // Why Telegram and not ntfy: ntfy.sh meters its free quota per *IP* ("basis":
 // "ip"), and shared egress IPs burn the daily quota via unrelated tenants so
 // every send 429s. The Telegram Bot API is keyed by bot token + chat,
 // independent of source IP, with no daily cap.
 
+// Collection handles only; the store base URL comes from env (a secret), so the
+// target site isn't hard-coded in this repo. Both read in full (maxPages null).
 const COLLECTIONS = [
-  {
-    name: "new-arrivals",
-    url: "https://scentoria.co.in/collections/new-arrivals/products.json",
-    maxPages: null, // read the whole collection (~5k items; items can land deep)
-    mode: "added",
-  },
-  {
-    name: "restocked-gems",
-    url: "https://scentoria.co.in/collections/restocked-gems/products.json",
-    maxPages: null, // read the whole collection
-    mode: "restocked",
-  },
+  { name: "new-arrivals", maxPages: null, mode: "added" }, // ~5k items; can land deep
+  { name: "restocked-gems", maxPages: null, mode: "restocked" },
 ];
 
 // Variant types we IGNORE for restock alerts (small try-size formats). Matched
@@ -57,8 +49,10 @@ const UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-const PRODUCT_URL = (h) => `https://scentoria.co.in/products/${h}`;
-const COLLECTION_URL = (c) => `https://scentoria.co.in/collections/${c}`;
+// Store URLs are derived from env.STORE_BASE_URL (a secret) at runtime.
+const storeBase = (env) => (env.STORE_BASE_URL || "").replace(/\/+$/, "");
+const productUrl = (base, h) => `${base}/products/${h}`;
+const collectionUrl = (base, c) => `${base}/collections/${c}`;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -116,9 +110,9 @@ async function fetchProducts(url, maxPages) {
 // Real-time set of in-stock variant-id strings from the storefront .js endpoint
 // (same data the live page uses). Returns null if the check itself failed, so
 // the caller can retry next run rather than act on a guess.
-async function liveAvailableVariants(handle) {
+async function liveAvailableVariants(base, handle) {
   try {
-    const r = await fetch(`${PRODUCT_URL(handle)}.js`, { headers: { "User-Agent": UA } });
+    const r = await fetch(`${productUrl(base, handle)}.js`, { headers: { "User-Agent": UA } });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     return new Set((data.variants || []).filter((v) => v.available).map((v) => String(v.id)));
@@ -177,13 +171,14 @@ async function sendTelegram(env, { text, url, preview = false }) {
 // succeeded. The caller records only delivered ids as seen.
 
 async function notifyAdded(env, collection, label, products) {
+  const base = storeBase(env);
   if (products.length > MAX_INDIVIDUAL) {
     const preview = products.slice(0, 5).map((p) => p.title).join(", ");
     const ok = await sendTelegram(env, {
       text:
         `🛍️ <b>${products.length} new in ${esc(label)}</b>\n` +
         `${esc(preview)} … and ${products.length - 5} more.\n` +
-        `<a href="${COLLECTION_URL(collection)}">View collection</a>`,
+        `<a href="${collectionUrl(base, collection)}">View collection</a>`,
     });
     return ok ? new Set(products.map((p) => String(p.id))) : new Set();
   }
@@ -191,7 +186,7 @@ async function notifyAdded(env, collection, label, products) {
     products.map(async (p) => {
       const price = productPrice(p);
       const head = price ? `₹${esc(price)}` : "New product";
-      const link = PRODUCT_URL(p.handle || "");
+      const link = productUrl(base, p.handle || "");
       const ok = await sendTelegram(env, {
         text:
           `🛍️ <b><a href="${link}">${esc(p.title || "Product")}</a></b>\n` +
@@ -208,6 +203,7 @@ async function notifyAdded(env, collection, label, products) {
 // `items` is a list of { p, v }. Group by product so a product restocking
 // several variants becomes one notification that names the variants.
 async function notifyRestocked(env, collection, label, items) {
+  const base = storeBase(env);
   const byProduct = new Map();
   for (const { p, v } of items) {
     if (!byProduct.has(p.id)) byProduct.set(p.id, { p, vs: [] });
@@ -221,7 +217,7 @@ async function notifyRestocked(env, collection, label, items) {
       text:
         `🔥 <b>${groups.length} back in stock in ${esc(label)}</b>\n` +
         `${esc(preview)} … and ${groups.length - 5} more.\n` +
-        `<a href="${COLLECTION_URL(collection)}">View collection</a>`,
+        `<a href="${collectionUrl(base, collection)}">View collection</a>`,
     });
     return ok ? new Set(groups.map((g) => String(g.p.id))) : new Set();
   }
@@ -235,7 +231,7 @@ async function notifyRestocked(env, collection, label, items) {
         const cheapest = prices.reduce((a, b) => (Number(b) < Number(a) ? b : a));
         priceLine = prices.length === 1 ? ` · ₹${cheapest}` : ` · from ₹${cheapest}`;
       }
-      const link = PRODUCT_URL(p.handle || "");
+      const link = productUrl(base, p.handle || "");
       const ok = await sendTelegram(env, {
         text:
           `🔥 <b><a href="${link}">${esc(p.title || "Product")}</a></b>\n` +
@@ -285,6 +281,7 @@ async function processAdded(env, name, label, products) {
 }
 
 async function processRestocked(env, name, label, products) {
+  const base = storeBase(env);
   // Candidate in-stock notifiable variants from the (cached) collection feed.
   const candidates = new Map(); // variant-id -> { p, v }
   for (const p of products) {
@@ -325,7 +322,7 @@ async function processRestocked(env, name, label, products) {
   const confirmedIds = new Set();
   const confirmed = [];
   for (const [handle, ids] of byHandle) {
-    const live = await liveAvailableVariants(handle);
+    const live = await liveAvailableVariants(base, handle);
     if (live === null) continue; // couldn't confirm — retry next run
     for (const id of ids) {
       if (live.has(id)) {
@@ -358,12 +355,17 @@ async function processRestocked(env, name, label, products) {
 // Entry points
 
 async function runChecks(env) {
+  const base = storeBase(env);
+  if (!base) {
+    console.error("STORE_BASE_URL is not set; cannot fetch.");
+    return "STORE_BASE_URL not set.";
+  }
   const log = [];
   for (const c of COLLECTIONS) {
     const label = titleCase(c.name);
     let products;
     try {
-      products = await fetchProducts(c.url, c.maxPages);
+      products = await fetchProducts(`${base}/collections/${c.name}/products.json`, c.maxPages);
     } catch (e) {
       log.push(`[${c.name}] fetch failed: ${e}`);
       console.error(log[log.length - 1]);

@@ -1,9 +1,9 @@
 {
-  "name": "scentoria-monitor",
+  "name": "stock-monitor",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Notifies on new arrivals and restocks at scentoria.co.in via a Telegram bot, on a GitHub Actions cron.",
+  "description": "Notifies on new arrivals and restocks at a Shopify store via a Telegram bot, on a GitHub Actions cron.",
   "scripts": {
     "start": "node src/run.mjs",
     "test": "node test/monitor.test.mjs"

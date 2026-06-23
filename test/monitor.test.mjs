@@ -46,6 +46,7 @@ global.fetch = async (url, opts = {}) => {
 function makeEnv() {
   const store = new Map();
   return {
+    STORE_BASE_URL: "https://example.test",
     TG_BOT_TOKEN: "x",
     TG_CHAT_ID: "1",
     STATE: {

@@ -3,9 +3,9 @@
 // (JSON under state/, committed back to the repo by the workflow) and Telegram
 // credentials from the environment, then runs the shared logic in monitor.js.
 //
-//   TG_BOT_TOKEN, TG_CHAT_ID  — required (GitHub Secrets in CI).
+//   STORE_BASE_URL, TG_BOT_TOKEN, TG_CHAT_ID  — required (GitHub Secrets in CI).
 //
-// Run locally:  TG_BOT_TOKEN=… TG_CHAT_ID=… node src/run.mjs
+// Run locally:  STORE_BASE_URL=… TG_BOT_TOKEN=… TG_CHAT_ID=… node src/run.mjs
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -15,6 +15,7 @@ import { runChecks } from "./monitor.js";
 const STATE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "state");
 
 const env = {
+  STORE_BASE_URL: process.env.STORE_BASE_URL,
   TG_BOT_TOKEN: process.env.TG_BOT_TOKEN,
   TG_CHAT_ID: process.env.TG_CHAT_ID,
   STATE: {
@@ -35,8 +36,8 @@ const env = {
   },
 };
 
-if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) {
-  console.error("TG_BOT_TOKEN and TG_CHAT_ID environment variables are required.");
+if (!env.STORE_BASE_URL || !env.TG_BOT_TOKEN || !env.TG_CHAT_ID) {
+  console.error("STORE_BASE_URL, TG_BOT_TOKEN and TG_CHAT_ID environment variables are required.");
   process.exit(1);
 }
 

@@ -1,4 +1,4 @@
-name: Scentoria stock monitor
+name: Stock monitor
 
 on:
   schedule:
@@ -13,7 +13,7 @@ permissions:
 
 # Never run two checks at once (avoids state-commit races / double sends).
 concurrency:
-  group: scentoria-monitor
+  group: stock-monitor
   cancel-in-progress: false
 
 jobs:
@@ -30,6 +30,7 @@ jobs:
 
       - name: Check collections and notify
         env:
+          STORE_BASE_URL: ${{ secrets.STORE_BASE_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: node src/run.mjs

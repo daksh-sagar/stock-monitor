@@ -1,7 +1,8 @@
-# Scentoria stock monitor
+# Stock monitor
 
-A **GitHub Actions cron** (every ~5 minutes) that sends a **free push
-notification to your phone** (via a [Telegram](https://telegram.org) bot) for:
+A **GitHub Actions cron** (every ~5 minutes) that watches a Shopify store and
+sends a **free push notification to your phone** (via a
+[Telegram](https://telegram.org) bot) for:
 
 - **new-arrivals** → when a **new product is listed**.
 - **restocked-gems** → when a tester / retail / partial / set variant comes
@@ -65,12 +66,14 @@ its state in this repo.
   `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and read
   `result[].message.chat.id` (a number, negative for groups).
 
-### 2. Add the two GitHub Secrets
+### 2. Add the GitHub Secrets
 
 In the repo: **Settings → Secrets and variables → Actions → New repository
-secret** (or via the CLI):
+secret** (or via the CLI). The store URL is a secret too, so the target site
+isn't hard-coded in this repo:
 
 ```bash
+printf '%s' "https://your-store.example"  | gh secret set STORE_BASE_URL
 printf '%s' "123456789:AA_your_bot_token" | gh secret set TG_BOT_TOKEN
 printf '%s' "your_chat_id"                | gh secret set TG_CHAT_ID
 ```
@@ -90,7 +93,7 @@ Actions → General → Workflow permissions → Read and write permissions**.
   ```bash
   TG_BOT_TOKEN=… TG_CHAT_ID=… npm start
   ```
-- **Run it on demand in CI:** Actions tab → *Scentoria stock monitor* → **Run
+- **Run it on demand in CI:** Actions tab → *Stock monitor* → **Run
   workflow** (or `gh workflow run monitor.yml`).
 - **Logs:** the Actions tab; each run prints a one-line status per collection.
 - **Change frequency:** edit the `cron` in `.github/workflows/monitor.yml`
