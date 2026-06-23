@@ -1,4 +1,6 @@
-// Scentoria stock monitor — Cloudflare Worker (Cron Trigger).
+// Scentoria stock monitor — core logic (runs on Node, driven by src/run.mjs
+// from a GitHub Actions cron). Pure and storage-agnostic: callers inject an
+// `env` with { STATE: {get,put}, TG_BOT_TOKEN, TG_CHAT_ID }.
 //
 // Watches two Shopify collections and pushes a phone notification via a
 // Telegram bot:
@@ -8,25 +10,29 @@
 //                       ignored). Restocks are confirmed in real time via the
 //                       storefront .js endpoint before alerting.
 //
-// State (seen ids per collection) lives in Workers KV (binding: STATE). We read
-// every run but only WRITE when the set changes, to stay under the free-tier
-// 1,000 writes/day limit. Crucially, a product is only recorded as "seen" once
-// its notification has actually been delivered — a failed send leaves it unseen
-// so it is retried next run instead of being silently lost.
+// Both collections are read in FULL every run (no top-pages window): products
+// can be re-listed with an old created_at and land deep in the feed, so a
+// windowed read would miss them. Running on GitHub Actions (no per-run CPU cap)
+// makes parsing the whole catalog fine — what the Cloudflare Worker's 10ms-CPU
+// free-tier limit could not do.
 //
-// Required secrets: env.TG_BOT_TOKEN, env.TG_CHAT_ID.
-// Optional secret:  env.TRIGGER_KEY (enables the manual ?key=… HTTP trigger).
+// State (the set of seen ids per collection) is read via env.STATE every run
+// and WRITTEN only when the set changes. A product is recorded as "seen" only
+// once its notification has actually been delivered — a failed send leaves it
+// unseen so it is retried next run instead of being silently lost.
+//
+// Required: env.TG_BOT_TOKEN, env.TG_CHAT_ID.
 //
 // Why Telegram and not ntfy: ntfy.sh meters its free quota per *IP* ("basis":
-// "ip"), and Cloudflare Workers egress from shared IPs — so the daily quota is
-// burned through by unrelated tenants and every send 429s. The Telegram Bot API
-// is keyed by bot token + chat, independent of source IP, with no daily cap.
+// "ip"), and shared egress IPs burn the daily quota via unrelated tenants so
+// every send 429s. The Telegram Bot API is keyed by bot token + chat,
+// independent of source IP, with no daily cap.
 
 const COLLECTIONS = [
   {
     name: "new-arrivals",
     url: "https://scentoria.co.in/collections/new-arrivals/products.json",
-    maxPages: 3, // sorted newest-first; new items land on page 1
+    maxPages: null, // read the whole collection (~5k items; items can land deep)
     mode: "added",
   },
   {
@@ -45,7 +51,7 @@ const EXCLUDE_VARIANT_TYPES = [
 ];
 
 const PAGE_SIZE = 250;
-const HARD_PAGE_CAP = 25; // safety stop for full fetches
+const HARD_PAGE_CAP = 60; // safety stop for full fetches (~15k items)
 const MAX_INDIVIDUAL = 8; // beyond this, send one summary instead of N pushes
 const UA =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
@@ -89,7 +95,8 @@ function setsEqual(a, b) {
 async function fetchProducts(url, maxPages) {
   const limit = maxPages == null ? HARD_PAGE_CAP : maxPages;
   const products = [];
-  for (let page = 1; page <= limit; page++) {
+  let page = 1;
+  for (; page <= limit; page++) {
     const r = await fetch(`${url}?limit=${PAGE_SIZE}&page=${page}`, {
       headers: { "User-Agent": UA },
     });
@@ -97,7 +104,11 @@ async function fetchProducts(url, maxPages) {
     const batch = (await r.json()).products || [];
     if (batch.length === 0) break;
     products.push(...batch);
-    if (batch.length < PAGE_SIZE) break;
+    if (batch.length < PAGE_SIZE) break; // last (partial) page reached the end
+  }
+  // We stopped on the page cap with a still-full last page -> likely truncated.
+  if (page > limit && maxPages == null) {
+    console.warn(`[fetch] hit HARD_PAGE_CAP=${limit} for ${url}; collection may be truncated — raise the cap.`);
   }
   return products;
 }
@@ -123,7 +134,8 @@ async function loadSeen(env, name) {
 }
 
 async function saveSeen(env, name, ids) {
-  await env.STATE.put(name, JSON.stringify([...ids]));
+  // Sorted so the committed state file shows minimal, readable diffs run-to-run.
+  await env.STATE.put(name, JSON.stringify([...ids].sort()));
 }
 
 // Send one message via the Telegram Bot API. Returns true only if Telegram
@@ -369,36 +381,7 @@ async function runChecks(env) {
   return out;
 }
 
-export default {
-  async scheduled(event, env, ctx) {
-    await runChecks(env);
-  },
-
-  // Manual trigger / health check: GET ...?key=<your TRIGGER_KEY>
-  // Disabled unless the TRIGGER_KEY secret is set.
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (!env.TRIGGER_KEY || url.searchParams.get("key") !== env.TRIGGER_KEY) {
-      return new Response(
-        "forbidden — set the TRIGGER_KEY secret and append ?key=<TRIGGER_KEY>\n",
-        { status: 403 }
-      );
-    }
-    // ?test=1 -> send a one-off push via the real notify path (verifies delivery).
-    if (url.searchParams.get("test") === "1") {
-      const ok = await sendTelegram(env, {
-        text: "✅ <b>Scentoria monitor test</b>\nIf you can read this in Telegram, notifications work.",
-      });
-      return new Response(
-        ok ? "test push sent ✅\n" : "test push FAILED — run `npx wrangler tail` for details\n"
-      );
-    }
-    const out = await runChecks(env);
-    return new Response(out + "\n", { headers: { "content-type": "text/plain" } });
-  },
-};
-
-// Exported for tests.
+// Exported for the Node entry point (src/run.mjs) and tests.
 export {
   isNotifiableVariant,
   processAdded,
