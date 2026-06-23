@@ -1,6 +1,7 @@
 # Stock monitor
 
-A **GitHub Actions cron** (every ~5 minutes) that watches a Shopify store and
+A **GitHub Actions workflow**, triggered every few minutes by a free external
+cron service (via the `workflow_dispatch` API), that watches a Shopify store and
 sends a **free push notification to your phone** (via a
 [Telegram](https://telegram.org) bot) for:
 
@@ -45,8 +46,13 @@ its state in this repo.
 > **Why GitHub Actions (and not a Cloudflare Worker)?** Reading the *whole*
 > ~5k-item collection needs more CPU than the Workers Free plan allows (10 ms
 > per invocation — the run was killed mid-parse). GitHub Actions runners have no
-> per-run CPU cap. The trade-off: GitHub's cron minimum is 5 minutes and
-> scheduled runs can be delayed a few minutes (occasionally skipped) under load.
+> per-run CPU cap.
+>
+> **Why an external trigger (and not GitHub's `schedule`)?** GitHub's native
+> cron is best-effort: it never reliably dispatched the schedule (first-run
+> activation can lag for hours, and `*/5` ticks get dropped under load). So the
+> workflow is `workflow_dispatch`-only and a free external cron service calls
+> the dispatch API on a fixed cadence — punctual, and with no 5-minute floor.
 
 > **Why Telegram (and not ntfy)?** ntfy.sh meters its free quota **per IP**
 > (`"basis": "ip"`), so on shared/cloud egress IPs the daily cap is burned
@@ -78,13 +84,31 @@ printf '%s' "123456789:AA_your_bot_token" | gh secret set TG_BOT_TOKEN
 printf '%s' "your_chat_id"                | gh secret set TG_CHAT_ID
 ```
 
-### 3. Enable the workflow
+### 3. Allow the workflow to commit state back
 
-The schedule lives in `.github/workflows/monitor.yml` and runs from the
-**default branch**. Once that's on `main`, the cron starts automatically; the
-first run seeds `state/` and sends the "monitoring started" messages. The
-workflow needs **Read and write** permissions to commit state back: **Settings →
-Actions → General → Workflow permissions → Read and write permissions**.
+**Settings → Actions → General → Workflow permissions → Read and write
+permissions.** (The job commits `state/*.json` back to the repo.) The workflow
+lives in `.github/workflows/monitor.yml` on the default branch; its first run
+seeds `state/` and sends the "monitoring started" messages.
+
+### 4. Set up the external trigger (the scheduler)
+
+The workflow is `workflow_dispatch`-only, so something must call it on a
+cadence. Use any free cron service (e.g. [cron-job.com](https://cron-job.com)):
+
+1. **Create a fine-grained PAT** (github.com/settings/personal-access-tokens):
+   repository access = **only this repo**; permission **Actions: Read and
+   write**; set an expiry.
+2. **Create a cron job** that POSTs every ~2 minutes:
+   ```
+   URL:    https://api.github.com/repos/<owner>/<repo>/actions/workflows/monitor.yml/dispatches
+   Method: POST
+   Headers: Accept: application/vnd.github+json
+            Authorization: Bearer <YOUR_PAT>
+            X-GitHub-Api-Version: 2022-11-28
+   Body:   {"ref":"main"}
+   ```
+   A successful trigger returns HTTP **204**.
 
 ## Testing & operating it
 
@@ -96,8 +120,8 @@ Actions → General → Workflow permissions → Read and write permissions**.
 - **Run it on demand in CI:** Actions tab → *Stock monitor* → **Run
   workflow** (or `gh workflow run monitor.yml`).
 - **Logs:** the Actions tab; each run prints a one-line status per collection.
-- **Change frequency:** edit the `cron` in `.github/workflows/monitor.yml`
-  (5 minutes is GitHub's minimum).
+- **Change frequency:** adjust the schedule in the external cron service
+  (no 5-minute floor — dispatch can fire as often as you like).
 - **Change which SKU types alert:** edit `EXCLUDE_VARIANT_TYPES` in
   `src/monitor.js`.
 - **Reset a collection:** delete `state/<name>.json` (`new-arrivals` or
