@@ -19,9 +19,10 @@ crons = ["*/2 * * * *"]
 binding = "STATE"
 id = "c9ac01a075cd42179cddb8ce25ded50f"
 
-# Default ntfy server; override per-deploy with a secret if you self-host.
-[vars]
-NTFY_SERVER = "https://ntfy.sh"
+# Notifications go to a Telegram bot. Set these as secrets, NOT here:
+#   printf '%s' "<bot token>" | npx wrangler secret put TG_BOT_TOKEN
+#   printf '%s' "<chat id>"   | npx wrangler secret put TG_CHAT_ID
+#   printf '%s' "<random>"    | npx wrangler secret put TRIGGER_KEY  # optional
 
 [observability]
 enabled = true
