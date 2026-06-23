@@ -1,12 +1,12 @@
 name: Stock monitor
 
 on:
-  schedule:
-    # Every 5 minutes (GitHub's minimum), offset to :02,:07,… to avoid the
-    # congested top-of-5-minute marks. GitHub schedules are best-effort: runs
-    # can be delayed several minutes — and occasionally skipped — under load.
-    - cron: "2-59/5 * * * *"
-  workflow_dispatch: {} # lets you run it manually from the Actions tab
+  # Triggered on a fixed cadence by a free external cron service that calls the
+  # workflow_dispatch REST API (.../actions/workflows/monitor.yml/dispatches).
+  # GitHub's native `schedule` is intentionally NOT used: its first-run
+  # activation proved unreliable (delayed for hours). Dispatch is punctual and
+  # has no 5-minute floor. Also runnable manually from the Actions tab.
+  workflow_dispatch: {}
 
 # Allow the job to commit the updated state file back to the repo.
 permissions:
