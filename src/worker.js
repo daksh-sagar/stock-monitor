@@ -1,6 +1,7 @@
 // Scentoria stock monitor — Cloudflare Worker (Cron Trigger).
 //
-// Watches two Shopify collections and pushes a phone notification via ntfy:
+// Watches two Shopify collections and pushes a phone notification via a
+// Telegram bot:
 //   - new-arrivals   -> alert when a NEW product is listed.
 //   - restocked-gems -> alert when a tester/retail/partial/set variant comes
 //                       BACK IN STOCK (decants/samples/miniatures/roll-ons are
@@ -9,9 +10,17 @@
 //
 // State (seen ids per collection) lives in Workers KV (binding: STATE). We read
 // every run but only WRITE when the set changes, to stay under the free-tier
-// 1,000 writes/day limit.
+// 1,000 writes/day limit. Crucially, a product is only recorded as "seen" once
+// its notification has actually been delivered — a failed send leaves it unseen
+// so it is retried next run instead of being silently lost.
 //
-// Required: env.NTFY_TOPIC (Worker secret). Optional: env.NTFY_SERVER, env.NTFY_TOKEN.
+// Required secrets: env.TG_BOT_TOKEN, env.TG_CHAT_ID.
+// Optional secret:  env.TRIGGER_KEY (enables the manual ?key=… HTTP trigger).
+//
+// Why Telegram and not ntfy: ntfy.sh meters its free quota per *IP* ("basis":
+// "ip"), and Cloudflare Workers egress from shared IPs — so the daily quota is
+// burned through by unrelated tenants and every send 429s. The Telegram Bot API
+// is keyed by bot token + chat, independent of source IP, with no daily cap.
 
 const COLLECTIONS = [
   {
@@ -66,9 +75,9 @@ function productPrice(p) {
   return v && v.price ? v.price : null;
 }
 
-function productImage(p) {
-  const img = (p.images || [])[0];
-  return img && img.src ? img.src : null;
+// Escape the small set of characters Telegram's HTML parse mode treats specially.
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function setsEqual(a, b) {
@@ -117,58 +126,71 @@ async function saveSeen(env, name, ids) {
   await env.STATE.put(name, JSON.stringify([...ids]));
 }
 
-async function sendNtfy(env, { title, message, click, tags, priority, icon }) {
-  if (!env.NTFY_TOPIC) {
-    console.error("NTFY_TOPIC not set; cannot notify.");
+// Send one message via the Telegram Bot API. Returns true only if Telegram
+// accepted it (HTTP 2xx) — callers rely on this to decide whether to record the
+// item as seen. `preview` shows a rich link card (product photo) for the URL.
+async function sendTelegram(env, { text, url, preview = false }) {
+  if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) {
+    console.error("TG_BOT_TOKEN/TG_CHAT_ID not set; cannot notify.");
     return false;
   }
-  const server = (env.NTFY_SERVER || "https://ntfy.sh").replace(/\/+$/, "");
-  const payload = { topic: env.NTFY_TOPIC, title, message };
-  if (click) payload.click = click;
-  if (tags) payload.tags = tags;
-  if (priority) payload.priority = priority;
-  if (icon) payload.icon = icon;
-  const headers = { "Content-Type": "application/json" };
-  if (env.NTFY_TOKEN) headers["Authorization"] = `Bearer ${env.NTFY_TOKEN}`;
+  const api = `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`;
+  const payload = {
+    chat_id: env.TG_CHAT_ID,
+    text,
+    parse_mode: "HTML",
+    link_preview_options:
+      preview && url ? { url, prefer_large_media: true } : { is_disabled: true },
+  };
   try {
-    const r = await fetch(server, { method: "POST", headers, body: JSON.stringify(payload) });
-    if (!r.ok) console.error(`ntfy HTTP ${r.status}: ${await r.text()}`);
+    const r = await fetch(api, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) console.error(`telegram HTTP ${r.status}: ${await r.text()}`);
     return r.ok;
   } catch (e) {
-    console.error(`ntfy error: ${e}`);
+    console.error(`telegram error: ${e}`);
     return false;
   }
 }
 
 // ---------------------------------------------------------------------------
 // Notifications
+//
+// Each notify* function returns the Set of product-id strings whose alert was
+// actually delivered. For the summary path that's all-or-nothing (one message
+// covers the whole batch); for the per-product path it's exactly the ones that
+// succeeded. The caller records only delivered ids as seen.
 
 async function notifyAdded(env, collection, label, products) {
   if (products.length > MAX_INDIVIDUAL) {
     const preview = products.slice(0, 5).map((p) => p.title).join(", ");
-    await sendNtfy(env, {
-      title: `${products.length} new in ${label}`,
-      message: `${preview} … and ${products.length - 5} more.`,
-      click: COLLECTION_URL(collection),
-      tags: ["shopping_bags"],
-      priority: 4,
+    const ok = await sendTelegram(env, {
+      text:
+        `🛍️ <b>${products.length} new in ${esc(label)}</b>\n` +
+        `${esc(preview)} … and ${products.length - 5} more.\n` +
+        `<a href="${COLLECTION_URL(collection)}">View collection</a>`,
     });
-    return;
+    return ok ? new Set(products.map((p) => String(p.id))) : new Set();
   }
-  await Promise.all(
-    products.map((p) => {
+  const results = await Promise.all(
+    products.map(async (p) => {
       const price = productPrice(p);
-      const head = price ? `₹${price}` : "New product";
-      return sendNtfy(env, {
-        title: p.title || "Product",
-        message: `${head}\nin ${label}`,
-        click: PRODUCT_URL(p.handle || ""),
-        tags: ["shopping_bags"],
-        priority: 4,
-        icon: productImage(p),
+      const head = price ? `₹${esc(price)}` : "New product";
+      const link = PRODUCT_URL(p.handle || "");
+      const ok = await sendTelegram(env, {
+        text:
+          `🛍️ <b><a href="${link}">${esc(p.title || "Product")}</a></b>\n` +
+          `${head} · in ${esc(label)}`,
+        url: link,
+        preview: true,
       });
+      return ok ? String(p.id) : null;
     })
   );
+  return new Set(results.filter(Boolean));
 }
 
 // `items` is a list of { p, v }. Group by product so a product restocking
@@ -183,18 +205,17 @@ async function notifyRestocked(env, collection, label, items) {
 
   if (groups.length > MAX_INDIVIDUAL) {
     const preview = groups.slice(0, 5).map((g) => g.p.title).join(", ");
-    await sendNtfy(env, {
-      title: `${groups.length} back in stock in ${label}`,
-      message: `${preview} … and ${groups.length - 5} more.`,
-      click: COLLECTION_URL(collection),
-      tags: ["fire"],
-      priority: 4,
+    const ok = await sendTelegram(env, {
+      text:
+        `🔥 <b>${groups.length} back in stock in ${esc(label)}</b>\n` +
+        `${esc(preview)} … and ${groups.length - 5} more.\n` +
+        `<a href="${COLLECTION_URL(collection)}">View collection</a>`,
     });
-    return;
+    return ok ? new Set(groups.map((g) => String(g.p.id))) : new Set();
   }
 
-  await Promise.all(
-    groups.map(({ p, vs }) => {
+  const results = await Promise.all(
+    groups.map(async ({ p, vs }) => {
       const names = vs.map(variantName).join(", ");
       const prices = vs.map((v) => v.price).filter(Boolean);
       let priceLine = "";
@@ -202,40 +223,53 @@ async function notifyRestocked(env, collection, label, items) {
         const cheapest = prices.reduce((a, b) => (Number(b) < Number(a) ? b : a));
         priceLine = prices.length === 1 ? ` · ₹${cheapest}` : ` · from ₹${cheapest}`;
       }
-      return sendNtfy(env, {
-        title: p.title || "Product",
-        message: `Back in stock: ${names}${priceLine}\nin ${label}`,
-        click: PRODUCT_URL(p.handle || ""),
-        tags: ["fire"],
-        priority: 4,
-        icon: productImage(p),
+      const link = PRODUCT_URL(p.handle || "");
+      const ok = await sendTelegram(env, {
+        text:
+          `🔥 <b><a href="${link}">${esc(p.title || "Product")}</a></b>\n` +
+          `Back in stock: ${esc(names + priceLine)}\nin ${esc(label)}`,
+        url: link,
+        preview: true,
       });
+      return ok ? String(p.id) : null;
     })
   );
+  return new Set(results.filter(Boolean));
 }
 
 // ---------------------------------------------------------------------------
 // Per-collection processing
 
 async function processAdded(env, name, label, products) {
-  const currentIds = products.map((p) => String(p.id));
-  const currentSet = new Set(currentIds);
   const seen = await loadSeen(env, name);
 
   if (seen === null) {
+    const currentIds = products.map((p) => String(p.id));
     await saveSeen(env, name, currentIds);
-    await sendNtfy(env, {
-      title: `Monitoring started: ${label}`,
-      message: `Now tracking ${currentIds.length} products in ${label}. You'll be alerted on new additions.`,
-      tags: ["eyes"],
+    await sendTelegram(env, {
+      text:
+        `👀 <b>Monitoring started: ${esc(label)}</b>\n` +
+        `Now tracking ${currentIds.length} products. You'll be alerted on new additions.`,
     });
     return `[${name}] first run — seeded ${currentIds.length} products.`;
   }
 
   const fresh = products.filter((p) => !seen.has(String(p.id)));
-  if (fresh.length) await notifyAdded(env, name, label, fresh);
-  if (!setsEqual(currentSet, seen)) await saveSeen(env, name, currentIds);
-  return `[${name}] ${fresh.length} new listing(s); ${currentIds.length} tracked.`;
+  let delivered = new Set();
+  if (fresh.length) delivered = await notifyAdded(env, name, label, fresh);
+
+  // New seen = (previously-seen ids still in the window) + (freshly delivered).
+  // Fresh items whose push failed are omitted, so they retry next run. Ids that
+  // fell off the tracked pages naturally drop out.
+  const newSeen = new Set();
+  for (const p of products) {
+    const id = String(p.id);
+    if (seen.has(id) || delivered.has(id)) newSeen.add(id);
+  }
+  if (!setsEqual(newSeen, seen)) await saveSeen(env, name, newSeen);
+
+  const failed = fresh.length - delivered.size;
+  return `[${name}] ${fresh.length} new (${delivered.size} delivered${failed ? `, ${failed} retrying` : ""}); ${products.length} in window.`;
 }
 
 async function processRestocked(env, name, label, products) {
@@ -257,13 +291,12 @@ async function processRestocked(env, name, label, products) {
   const seen = await loadSeen(env, name);
   if (seen === null) {
     await saveSeen(env, name, [...candidates.keys()]);
-    await sendNtfy(env, {
-      title: `Monitoring started: ${label}`,
-      message:
-        `Watching ${label} for restocks of testers, retail, partials & sets ` +
+    await sendTelegram(env, {
+      text:
+        `👀 <b>Monitoring started: ${esc(label)}</b>\n` +
+        `Watching for restocks of testers, retail, partials & sets ` +
         `(decants, samples & miniatures ignored). Tracking ${candidates.size} ` +
         `in-stock variants — you'll be alerted when more come back.`,
-      tags: ["eyes"],
     });
     return `[${name}] first run — seeded ${candidates.size} in-stock variants.`;
   }
@@ -290,16 +323,23 @@ async function processRestocked(env, name, label, products) {
     }
   }
 
-  if (confirmed.length) await notifyRestocked(env, name, label, confirmed);
+  let delivered = new Set(); // product-id strings whose alert was delivered
+  if (confirmed.length) delivered = await notifyRestocked(env, name, label, confirmed);
 
-  // Keep previously-seen variants still in stock + newly confirmed ones.
-  // Unconfirmed candidates stay out so they're re-checked next run.
+  // Keep previously-seen variants still in stock + newly confirmed ones whose
+  // alert actually delivered. Unconfirmed/undelivered stay out for a retry.
   const newSeen = new Set();
   for (const id of seen) if (candidates.has(id)) newSeen.add(id);
-  for (const id of confirmedIds) newSeen.add(id);
+  let deliveredVariants = 0;
+  for (const id of confirmedIds) {
+    if (delivered.has(String(candidates.get(id).p.id))) {
+      newSeen.add(id);
+      deliveredVariants++;
+    }
+  }
   if (!setsEqual(newSeen, seen)) await saveSeen(env, name, newSeen);
 
-  return `[${name}] ${confirmed.length} confirmed restock(s); ${candidates.size} in stock; ${freshIds.length} candidate(s).`;
+  return `[${name}] ${confirmed.length} confirmed restock(s) (${deliveredVariants} delivered); ${candidates.size} in stock; ${freshIds.length} candidate(s).`;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,21 +374,20 @@ export default {
     await runChecks(env);
   },
 
-  // Manual trigger / health check: GET ...?key=<your NTFY_TOPIC>
+  // Manual trigger / health check: GET ...?key=<your TRIGGER_KEY>
+  // Disabled unless the TRIGGER_KEY secret is set.
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.searchParams.get("key") !== env.NTFY_TOPIC) {
-      return new Response("forbidden — append ?key=<your NTFY_TOPIC> to trigger\n", {
-        status: 403,
-      });
+    if (!env.TRIGGER_KEY || url.searchParams.get("key") !== env.TRIGGER_KEY) {
+      return new Response(
+        "forbidden — set the TRIGGER_KEY secret and append ?key=<TRIGGER_KEY>\n",
+        { status: 403 }
+      );
     }
     // ?test=1 -> send a one-off push via the real notify path (verifies delivery).
     if (url.searchParams.get("test") === "1") {
-      const ok = await sendNtfy(env, {
-        title: "✅ Scentoria monitor test",
-        message: "If you can read this on your phone, notifications work.",
-        tags: ["white_check_mark"],
-        priority: 4,
+      const ok = await sendTelegram(env, {
+        text: "✅ <b>Scentoria monitor test</b>\nIf you can read this in Telegram, notifications work.",
       });
       return new Response(
         ok ? "test push sent ✅\n" : "test push FAILED — run `npx wrangler tail` for details\n"

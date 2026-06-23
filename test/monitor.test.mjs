@@ -1,5 +1,5 @@
 // Offline tests for the Worker logic. Mocks global fetch (Shopify feed, .js
-// endpoint, ntfy) and KV, then exercises the same scenarios as the original
+// endpoint, Telegram) and KV, then exercises the same scenarios as the original
 // Python tests. Run: npm test
 import assert from "node:assert";
 import { processAdded, processRestocked, isNotifiableVariant } from "../src/worker.js";
@@ -7,7 +7,8 @@ import { processAdded, processRestocked, isNotifiableVariant } from "../src/work
 // --- mock state -----------------------------------------------------------
 let CATALOG = {}; // collection -> [products]
 let LIVE = {}; // handle -> [available variant id strings]
-let SENT = []; // captured ntfy payloads
+let SENT = []; // captured Telegram payloads
+let FAIL_SEND = false; // when true, the Telegram POST responds non-2xx
 
 function findByHandle(handle) {
   for (const products of Object.values(CATALOG)) {
@@ -37,7 +38,7 @@ global.fetch = async (url, opts = {}) => {
   }
   if (opts.method === "POST") {
     SENT.push(JSON.parse(opts.body));
-    return resp("ok");
+    return resp(FAIL_SEND ? "rate limited" : "ok", !FAIL_SEND);
   }
   return resp("unhandled", false);
 };
@@ -45,7 +46,8 @@ global.fetch = async (url, opts = {}) => {
 function makeEnv() {
   const store = new Map();
   return {
-    NTFY_TOPIC: "t",
+    TG_BOT_TOKEN: "x",
+    TG_CHAT_ID: "1",
     STATE: {
       get: async (k, type) => (store.has(k) ? (type === "json" ? JSON.parse(store.get(k)) : store.get(k)) : null),
       put: async (k, v) => void store.set(k, v),
@@ -82,7 +84,7 @@ async function restockedTests() {
 
   await run(); // seed
   check("seed: only o1 tracked (decant d1 excluded, r1/t1 sold out)", JSON.stringify(JSON.parse(env._store.get(NAME)).sort()) === JSON.stringify(["o1"]));
-  check("seed: one monitoring-started notification", SENT.length === 1 && SENT[0].title.includes("Monitoring started"));
+  check("seed: one monitoring-started notification", SENT.length === 1 && SENT[0].text.includes("Monitoring started"));
 
   setv(P1, "d1", false); setv(P1, "d1", true); LIVE.musc = ["d1"]; // decant toggles
   await run();
@@ -90,7 +92,7 @@ async function restockedTests() {
 
   setv(P1, "r1", true); LIVE.musc = ["d1", "r1"]; // retail back, .js confirms
   await run();
-  check("retail restock confirmed -> 1 alert naming 50 ML RETAIL", SENT.length === 1 && SENT[0].message.includes("50 ML RETAIL"));
+  check("retail restock confirmed -> 1 alert naming 50 ML RETAIL", SENT.length === 1 && SENT[0].text.includes("50 ML RETAIL"));
 
   setv(P2, "o2", true); LIVE.other = ["o1"]; // feed says o2 avail, .js does NOT confirm
   await run();
@@ -99,13 +101,13 @@ async function restockedTests() {
 
   LIVE.other = ["o1", "o2"]; // now .js confirms
   await run();
-  check("retry confirms o2 -> 1 alert", SENT.length === 1 && SENT[0].message.includes("100 ML RETAIL"));
+  check("retry confirms o2 -> 1 alert", SENT.length === 1 && SENT[0].text.includes("100 ML RETAIL"));
 
   setv(P1, "t1", true);
   P1.variants.push(V("t2", "30 ML TESTER", true));
   LIVE.musc = ["d1", "r1", "t1", "t2"];
   await run();
-  check("two variants same product -> 1 grouped alert", SENT.length === 1 && SENT[0].message.includes("100 ML TESTER") && SENT[0].message.includes("30 ML TESTER"));
+  check("two variants same product -> 1 grouped alert", SENT.length === 1 && SENT[0].text.includes("100 ML TESTER") && SENT[0].text.includes("30 ML TESTER"));
 
   setv(P2, "o1", false); LIVE.other = ["o2"]; // tester sells out
   await run();
@@ -126,7 +128,16 @@ async function addedTests() {
   check("added: no change -> no alert + no write detail", SENT.length === 0);
   CATALOG[NAME].unshift({ id: 99, title: "Arrival2", handle: "y", variants: [V("a2", "50 ML RETAIL", true)] });
   await run();
-  check("added: new listing -> 1 alert", SENT.length === 1 && SENT[0].title === "Arrival2");
+  check("added: new listing -> 1 alert", SENT.length === 1 && SENT[0].text.includes("Arrival2"));
+
+  // Silent-drop fix: a failed send must NOT mark the product seen.
+  FAIL_SEND = true;
+  CATALOG[NAME].unshift({ id: 123, title: "Arrival3", handle: "z", variants: [V("a3", "50 ML RETAIL", true)] });
+  await run();
+  check("added: send fails -> attempted but not saved", SENT.length === 1 && !JSON.parse(env._store.get(NAME)).includes("123"));
+  FAIL_SEND = false;
+  await run();
+  check("added: next run retries the dropped product -> delivered + saved", SENT.length === 1 && SENT[0].text.includes("Arrival3") && JSON.parse(env._store.get(NAME)).includes("123"));
 }
 
 await restockedTests();

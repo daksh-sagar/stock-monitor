@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Notifies on new arrivals and restocks at scentoria.co.in via ntfy, on a Cloudflare Worker cron.",
+  "description": "Notifies on new arrivals and restocks at scentoria.co.in via a Telegram bot, on a Cloudflare Worker cron.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

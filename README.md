@@ -1,7 +1,7 @@
 # Scentoria stock monitor
 
 A **Cloudflare Worker** (cron trigger, every 2 minutes) that sends a **free push
-notification to your phone** (via [ntfy](https://ntfy.sh)) for:
+notification to your phone** (via a [Telegram](https://telegram.org) bot) for:
 
 - **new-arrivals** → when a **new product is listed**.
 - **restocked-gems** → when a tester / retail / partial / set variant comes
@@ -30,34 +30,35 @@ No server to run, no cost. Cloudflare's free tier covers it comfortably.
 4. **KV writes only on change.** We read every run but only write when the
    tracked set actually changes — staying well under the free tier's 1,000
    writes/day.
-5. What does **not** alert: a decant restocking, an item selling out, or a
+5. **A product is recorded as seen only after its notification is delivered.**
+   If a send fails, the item stays unseen and is retried next run instead of
+   being silently lost. (Failed-send-then-mark-seen was a real bug.)
+6. What does **not** alert: a decant restocking, an item selling out, or a
    product being removed.
-6. **First run seeds silently** — records current state and sends one
+7. **First run seeds silently** — records current state and sends one
    "monitoring started" message instead of flooding you.
 
 ## One-time setup
 
-### 1. Install ntfy, subscribe, and get an access token
+### 1. Create a Telegram bot and find your chat id
 
-- Install **ntfy**: [iOS](https://apps.apple.com/app/ntfy/id1625396347) /
-  [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy).
-- **+ → Subscribe to topic**, enter a long random topic name (this is your only
-  "password" on the free tier, so keep it unguessable):
+- In Telegram, message [**@BotFather**](https://t.me/BotFather): send
+  `/newbot`, follow the prompts, and copy the **bot token** it gives you
+  (looks like `123456789:AA…`). This is `TG_BOT_TOKEN` in step 4.
+- **Start a chat with your new bot** and send it any message (e.g. `hi`) — a
+  bot can't message you until you've messaged it first.
+- **Get your chat id:** open
+  `https://api.telegram.org/bot<TG_BOT_TOKEN>/getUpdates` in a browser and read
+  `result[].message.chat.id` (a number, possibly negative for groups). That's
+  `TG_CHAT_ID` in step 4.
 
-  ```
-  scentoria-kmiw08euftlucpwx
-  ```
-- **Create a free ntfy.sh account and access token** (required — see note
-  below). At [ntfy.sh](https://ntfy.sh): **Sign up**, then **Account → Access
-  tokens → Create access token** (label it `scentoria-worker`, expiry "Never").
-  Copy the `tk_…` token for step 4.
-
-  > **Why a token?** ntfy rate-limits *anonymous* publishing by the publisher's
-  > IP, and Cloudflare Workers egress from **shared IPs** — so anonymous sends
-  > collide with other Cloudflare users and get HTTP 429 almost immediately.
-  > Authenticating ties the limit to your account (250 msgs/day free, we use a
-  > handful), which fixes it. Your phone still just subscribes to the public
-  > topic; the token is only used by the Worker to publish.
+  > **Why Telegram and not ntfy?** ntfy.sh meters its free quota **per IP**
+  > (`"basis": "ip"` on free accounts), and Cloudflare Workers egress from
+  > **shared IPs** — so the daily 250-message cap is burned through by unrelated
+  > Cloudflare tenants and every send 429s, *even with an access token* (the
+  > token authenticates but doesn't move you off the shared-IP quota; only a
+  > paid tier does). The Telegram Bot API is keyed by bot token + chat,
+  > independent of source IP, with no daily cap.
 
 ### 2. Authenticate Cloudflare
 
@@ -77,15 +78,18 @@ npx wrangler kv namespace create STATE
 
 Copy the printed `id` into `wrangler.toml`, replacing `REPLACE_WITH_KV_NAMESPACE_ID`.
 
-### 4. Set the ntfy secrets
+### 4. Set the Telegram secrets
 
 ```bash
-printf '%s' "scentoria-kmiw08euftlucpwx" | npx wrangler secret put NTFY_TOPIC
-printf '%s' "tk_your_token_here"          | npx wrangler secret put NTFY_TOKEN
+printf '%s' "123456789:AA_your_bot_token" | npx wrangler secret put TG_BOT_TOKEN
+printf '%s' "your_chat_id"                | npx wrangler secret put TG_CHAT_ID
+# Optional — enables the manual ?key=… HTTP trigger/test endpoint:
+printf '%s' "$(openssl rand -hex 16)"     | npx wrangler secret put TRIGGER_KEY
 ```
 
 (Use `printf`, not `echo`, to avoid a trailing newline in the value.)
-`NTFY_SERVER` defaults to `https://ntfy.sh` (see `[vars]` in `wrangler.toml`).
+The old `NTFY_*` secrets are unused now and can be removed:
+`npx wrangler secret delete NTFY_TOKEN` and `npx wrangler secret delete NTFY_TOPIC`.
 
 ### 5. Deploy
 
@@ -102,12 +106,12 @@ state silently and sends the "monitoring started" pushes.
 
 - **Logic tests** (offline, no Cloudflare needed): `npm test`
 - **Test a push to your phone:** open
-  `https://scentoria-monitor.<your-subdomain>.workers.dev/?key=<NTFY_TOPIC>&test=1`
+  `https://scentoria-monitor.<your-subdomain>.workers.dev/?key=<TRIGGER_KEY>&test=1`
   — sends one "✅ test" notification.
 - **Trigger a check manually** (also a health check):
-  `https://scentoria-monitor.<your-subdomain>.workers.dev/?key=<NTFY_TOPIC>`
-  (the `key` must equal your `NTFY_TOPIC`). Returns a one-line status per
-  collection.
+  `https://scentoria-monitor.<your-subdomain>.workers.dev/?key=<TRIGGER_KEY>`
+  (the `key` must equal your `TRIGGER_KEY` secret; the endpoint is disabled if
+  that secret isn't set). Returns a one-line status per collection.
 - **Live logs:** `npx wrangler tail`
 - **Change frequency:** edit `crons` in `wrangler.toml` (e.g. `"*/1 * * * *"`
   for every minute) and redeploy.
