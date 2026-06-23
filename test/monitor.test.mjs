@@ -2,7 +2,7 @@
 // endpoint, Telegram) and KV, then exercises the same scenarios as the original
 // Python tests. Run: npm test
 import assert from "node:assert";
-import { processAdded, processRestocked, isNotifiableVariant } from "../src/worker.js";
+import { processAdded, processRestocked, isNotifiableVariant } from "../src/monitor.js";
 
 // --- mock state -----------------------------------------------------------
 let CATALOG = {}; // collection -> [products]
