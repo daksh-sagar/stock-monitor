@@ -114,6 +114,16 @@ async function restockedTests() {
   await run();
   check("sell-out -> no alert", SENT.length === 0);
   check("sell-out -> o1 dropped from state", !JSON.parse(env._store.get(NAME)).includes("o1"));
+
+  // Pagination-flicker fix: a seen in-stock variant whose product drops out of
+  // the feed must NOT be treated as sold-out, else it re-alerts on return.
+  CATALOG[NAME] = [P1]; // P2 (with in-stock o2) momentarily missing from feed
+  await run();
+  check("restock: variant missing from feed -> not dropped", JSON.parse(env._store.get(NAME)).includes("o2"));
+  check("restock: missing-from-feed -> no alert", SENT.length === 0);
+  CATALOG[NAME] = [P1, P2]; LIVE.other = ["o2"]; // P2 returns, o2 still in stock
+  await run();
+  check("restock: reappearing in-stock variant -> no duplicate alert", SENT.length === 0);
 }
 
 // --- new-arrivals scenarios ------------------------------------------------
@@ -139,6 +149,16 @@ async function addedTests() {
   FAIL_SEND = false;
   await run();
   check("added: next run retries the dropped product -> delivered + saved", SENT.length === 1 && SENT[0].text.includes("Arrival3") && JSON.parse(env._store.get(NAME)).includes("123"));
+
+  // Pagination-flicker fix: a seen product that drops out of the feed must stay
+  // seen and must NOT re-notify when it reappears.
+  const full = CATALOG[NAME];
+  CATALOG[NAME] = full.filter((p) => p.id !== 99); // 99 momentarily missing
+  await run();
+  check("added: seen product missing from feed -> no alert, stays seen", SENT.length === 0 && JSON.parse(env._store.get(NAME)).includes("99"));
+  CATALOG[NAME] = full; // 99 reappears in the feed
+  await run();
+  check("added: reappearing product -> no duplicate alert", SENT.length === 0);
 }
 
 await restockedTests();

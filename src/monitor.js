@@ -266,26 +266,28 @@ async function processAdded(env, name, label, products) {
   let delivered = new Set();
   if (fresh.length) delivered = await notifyAdded(env, name, label, fresh);
 
-  // New seen = (previously-seen ids still in the window) + (freshly delivered).
-  // Fresh items whose push failed are omitted, so they retry next run. Ids that
-  // fell off the tracked pages naturally drop out.
-  const newSeen = new Set();
-  for (const p of products) {
-    const id = String(p.id);
-    if (seen.has(id) || delivered.has(id)) newSeen.add(id);
-  }
+  // `seen` is MONOTONIC for new-arrivals: once a product id is recorded we keep
+  // it forever and only ADD newly-delivered ids. We must NOT prune ids that are
+  // merely absent from this fetch — the ~5k-item feed is paginated across ~20
+  // pages of a live, changing collection, so boundary products intermittently
+  // drop out of a fetch. Pruning on absence made them re-appear as "new" and
+  // re-notify every few minutes (the duplicate-notifications bug).
+  const newSeen = new Set(seen);
+  for (const id of delivered) newSeen.add(id);
   if (!setsEqual(newSeen, seen)) await saveSeen(env, name, newSeen);
 
   const failed = fresh.length - delivered.size;
-  return `[${name}] ${fresh.length} new (${delivered.size} delivered${failed ? `, ${failed} retrying` : ""}); ${products.length} in window.`;
+  return `[${name}] ${fresh.length} new (${delivered.size} delivered${failed ? `, ${failed} retrying` : ""}); ${products.length} in feed.`;
 }
 
 async function processRestocked(env, name, label, products) {
   const base = storeBase(env);
   // Candidate in-stock notifiable variants from the (cached) collection feed.
-  const candidates = new Map(); // variant-id -> { p, v }
+  const candidates = new Map(); // variant-id -> { p, v }  (in-stock + notifiable)
+  const fetchedVariantIds = new Set(); // EVERY variant id seen in this fetch
   for (const p of products) {
     for (const v of p.variants || []) {
+      fetchedVariantIds.add(String(v.id));
       if (v.available && isNotifiableVariant(v)) candidates.set(String(v.id), { p, v });
     }
   }
@@ -335,10 +337,17 @@ async function processRestocked(env, name, label, products) {
   let delivered = new Set(); // product-id strings whose alert was delivered
   if (confirmed.length) delivered = await notifyRestocked(env, name, label, confirmed);
 
-  // Keep previously-seen variants still in stock + newly confirmed ones whose
-  // alert actually delivered. Unconfirmed/undelivered stay out for a retry.
+  // Rebuild seen. Keep a previously-seen variant if it's still an in-stock
+  // candidate, OR if it's entirely ABSENT from this fetch — absence means a
+  // pagination miss on this changing feed, not a sell-out, and dropping it
+  // would make it re-alert as a "restock" when it reappears. Only drop a
+  // variant that IS present in the fetch but is no longer an in-stock candidate
+  // (a genuine sell-out) — so it correctly re-alerts when it actually restocks.
+  // Newly confirmed variants are added only if their alert delivered.
   const newSeen = new Set();
-  for (const id of seen) if (candidates.has(id)) newSeen.add(id);
+  for (const id of seen) {
+    if (candidates.has(id) || !fetchedVariantIds.has(id)) newSeen.add(id);
+  }
   let deliveredVariants = 0;
   for (const id of confirmedIds) {
     if (delivered.has(String(candidates.get(id).p.id))) {
